@@ -669,10 +669,13 @@ ControlAllocator::publish_actuator_controls()
 
 	// motors
 	int motors_idx;
+	int off_motor_idx = 0;
 
 	for (motors_idx = 0; motors_idx < _num_actuators[0] && motors_idx < actuator_motors_s::NUM_CONTROLS; motors_idx++) {
 		int selected_matrix = _control_allocation_selection_indexes[actuator_idx];
 		float actuator_sp = _control_allocation[selected_matrix]->getActuatorSetpoint()(actuator_idx_matrix[selected_matrix]);
+
+		actuator_sp = motors_idx != off_motor_idx ? actuator_sp : 0.f; // Apply off motor logic before setting motor value to it
 		actuator_motors.control[motors_idx] = PX4_ISFINITE(actuator_sp) ? actuator_sp : NAN;
 
 		if (stopped_motors & (1u << motors_idx)) {
@@ -682,6 +685,9 @@ ControlAllocator::publish_actuator_controls()
 		++actuator_idx_matrix[selected_matrix];
 		++actuator_idx;
 	}
+
+	// PX4_INFO("Setpoint for Actuator Motors [%f, %f, %f, %f]", (double)actuator_motors.control[0], (double)actuator_motors.control[1], (double)actuator_motors.control[2], (double)actuator_motors.control[3]);
+
 
 	for (int i = motors_idx; i < actuator_motors_s::NUM_CONTROLS; i++) {
 		actuator_motors.control[i] = NAN;
