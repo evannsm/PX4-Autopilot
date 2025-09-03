@@ -646,11 +646,116 @@ ControlAllocator::publish_control_allocator_status(int matrix_index)
 }
 
 void
+ControlAllocator::update_inhibit_state(const hrt_abstime now)
+{
+	// Member arrays assumed in the header:
+	//   hrt_abstime _inhibit_end_us[actuator_motors_s::NUM_CONTROLS];
+	//   float       _inhibit_toggle_hz[actuator_motors_s::NUM_CONTROLS];
+	//   hrt_abstime _toggle_interval_us[actuator_motors_s::NUM_CONTROLS];   // renamed from _inhibit_half_period_us
+	//   hrt_abstime _inhibit_next_toggle_us[actuator_motors_s::NUM_CONTROLS];
+	//   bool        _inhibit_phase_on[actuator_motors_s::NUM_CONTROLS];     // true => output 0.0 (OFF), false => 1.0 (ON)
+
+	// We use switching rate semantics (not square waves which need 2 edges / cycle)
+	// Switching rate is edges/sec (one edge per control cycle)
+	constexpr float kLoopRateHz = 240.f; // 10Hz under the module rate to be safe.
+	const hrt_abstime min_toggle_us = (hrt_abstime)llroundf(1e6f / kLoopRateHz);
+
+	// If a new message arrived, (re)initialize per-motor timers/state
+	if (_actuator_inhibit_sub.updated()) {
+		actuator_inhibit_s msg{};
+
+		if (_actuator_inhibit_sub.copy(&msg)) {
+			const float std_time_horizon = 3.0f;             // default inhibit window (seconds)
+
+			for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+				// Message arrays are length 12; guard indices >= 12
+				const bool mask_on = (i < 12) ? (msg.inhibit_mask[i] != 0) : false; // we ignore indices above 12
+
+				if (mask_on) {
+					// Time horizon: use provided value, else default to std_time_horizon
+					const float time_horizon =
+						(i < 12 && PX4_ISFINITE(msg.horizon_s[i]) && msg.horizon_s[i] > 0.f)
+							? msg.horizon_s[i]
+							: std_time_horizon;
+
+					// Store absolute deadline in microseconds since boot
+					_inhibit_end_us[i] = now + (hrt_abstime)llroundf(time_horizon * 1e6f);
+
+					// Pulse frequency (switching rate, edges/sec). 0/NaN => no pulsing (steady OFF)
+					float pulse_frequency =
+						(i < 12 && PX4_ISFINITE(msg.toggle_hz[i]) && msg.toggle_hz[i] > 0.f)
+							? msg.toggle_hz[i]
+							: 0.f;
+
+					// Clamp to loop rate (one edge per control cycle)
+					pulse_frequency = math::constrain(pulse_frequency, 0.f, kLoopRateHz);
+					_inhibit_toggle_hz[i] = pulse_frequency;
+
+					if (pulse_frequency > 0.f) {
+						// Toggle interval (seconds -> microseconds)
+						hrt_abstime toggle_dt = (hrt_abstime)llroundf((1.0f / pulse_frequency) * 1e6f);
+
+						// Floor at one control period to avoid multiple edges per cycle
+						if (toggle_dt < min_toggle_us) {
+							toggle_dt = min_toggle_us;
+						}
+
+						_toggle_interval_us[i]     = toggle_dt;
+						_inhibit_next_toggle_us[i] = now + _toggle_interval_us[i];
+
+						// Start ON for the first interval (phase_on=false => output 1.0)
+						_inhibit_phase_on[i] = false;
+
+					} else {
+						// Steady OFF (no pulsing)
+						_toggle_interval_us[i]     = 0;
+						_inhibit_next_toggle_us[i] = 0;
+						_inhibit_phase_on[i]       = true;   // not used in steady mode; set to OFF by convention
+					}
+
+				} else {
+					// Mask cleared -> clear any inhibition immediately
+					_inhibit_end_us[i]         = 0;
+					_inhibit_toggle_hz[i]      = 0.f;
+					_toggle_interval_us[i]     = 0;
+					_inhibit_next_toggle_us[i] = 0;
+					_inhibit_phase_on[i]       = false;
+				}
+			}
+		}
+	}
+
+	// Advance toggles and expire horizons each cycle
+	for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
+		// Progress pulsing edges if active
+		if (_inhibit_end_us[i] > 0 && _inhibit_toggle_hz[i] > 0.f && _inhibit_next_toggle_us[i] > 0) {
+			while (now >= _inhibit_next_toggle_us[i]) {
+				_inhibit_phase_on[i] = !_inhibit_phase_on[i];           // flip OFF<->ON
+				_inhibit_next_toggle_us[i] += _toggle_interval_us[i];    // schedule next edge
+			}
+		}
+
+		// Expire time horizon
+		if (_inhibit_end_us[i] > 0 && now > _inhibit_end_us[i]) {
+			_inhibit_end_us[i]         = 0;
+			_inhibit_toggle_hz[i]      = 0.f;
+			_toggle_interval_us[i]     = 0;
+			_inhibit_next_toggle_us[i] = 0;
+			_inhibit_phase_on[i]       = false;
+		}
+	}
+}
+
+
+void
 ControlAllocator::publish_actuator_controls()
 {
 	if (!_publish_controls) {
 		return;
 	}
+
+	const hrt_abstime now = hrt_absolute_time();
+	update_inhibit_state(now);
 
 	actuator_motors_s actuator_motors;
 	actuator_motors.timestamp = hrt_absolute_time();
@@ -669,13 +774,28 @@ ControlAllocator::publish_actuator_controls()
 
 	// motors
 	int motors_idx;
-	int off_motor_idx = 0;
+	// int off_motor_idx = 8;
 
 	for (motors_idx = 0; motors_idx < _num_actuators[0] && motors_idx < actuator_motors_s::NUM_CONTROLS; motors_idx++) {
 		int selected_matrix = _control_allocation_selection_indexes[actuator_idx];
 		float actuator_sp = _control_allocation[selected_matrix]->getActuatorSetpoint()(actuator_idx_matrix[selected_matrix]);
 
-		actuator_sp = motors_idx != off_motor_idx ? actuator_sp : 0.f; // Apply off motor logic before setting motor value to it
+		// actuator_sp = motors_idx != off_motor_idx ? actuator_sp : 0.f; // Apply off motor logic before setting motor value to it
+
+
+		// NEW: Inhibit / pulse overlay
+		if (_inhibit_end_us[motors_idx] > now) {
+			if (_inhibit_toggle_hz[motors_idx] > 0.f) {
+				// Pulsing at requested switching rate: 0.0 (OFF) <-> 1.0 (ON)
+				actuator_sp = _inhibit_phase_on[motors_idx] ? 0.f : 1.f;
+			} else {
+				// Steady inhibit
+				actuator_sp = 0.f;
+			}
+		}
+
+
+		// --- Back to original code
 		actuator_motors.control[motors_idx] = PX4_ISFINITE(actuator_sp) ? actuator_sp : NAN;
 
 		if (stopped_motors & (1u << motors_idx)) {
@@ -686,7 +806,9 @@ ControlAllocator::publish_actuator_controls()
 		++actuator_idx;
 	}
 
-	// PX4_INFO("Setpoint for Actuator Motors [%f, %f, %f, %f]", (double)actuator_motors.control[0], (double)actuator_motors.control[1], (double)actuator_motors.control[2], (double)actuator_motors.control[3]);
+	PX4_INFO("Setpoint for Actuator Motors [%f, %f, %f, %f]", (double)actuator_motors.control[0], (double)actuator_motors.control[1], (double)actuator_motors.control[2], (double)actuator_motors.control[3]);
+
+	// PX4_INFO("_num_actuators[0]: %d", _num_actuators[0]);
 
 
 	for (int i = motors_idx; i < actuator_motors_s::NUM_CONTROLS; i++) {

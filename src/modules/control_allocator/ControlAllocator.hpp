@@ -78,6 +78,8 @@
 #include <uORB/topics/vehicle_thrust_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/failure_detector_status.h>
+#include <uORB/topics/actuator_inhibit.h>
+
 
 class ControlAllocator : public ModuleBase<ControlAllocator>, public ModuleParams, public px4::ScheduledWorkItem
 {
@@ -138,6 +140,9 @@ private:
 
 	void publish_actuator_controls();
 
+	void update_inhibit_state(const hrt_abstime now);
+
+
 	AllocationMethod _allocation_method_id{AllocationMethod::NONE};
 	ControlAllocation *_control_allocation[ActuatorEffectiveness::MAX_NUM_MATRICES] {}; 	///< class for control allocation calculations
 	int _num_control_allocation{0};
@@ -180,6 +185,10 @@ private:
 	uORB::Subscription _vehicle_torque_setpoint1_sub{ORB_ID(vehicle_torque_setpoint), 1};  /**< vehicle torque setpoint subscription (2. instance) */
 	uORB::Subscription _vehicle_thrust_setpoint1_sub{ORB_ID(vehicle_thrust_setpoint), 1};	 /**< vehicle thrust setpoint subscription (2. instance) */
 
+	// --- Inhibition (uORB) ---
+	uORB::Subscription _actuator_inhibit_sub{ORB_ID(actuator_inhibit)};
+
+
 	// Outputs
 	uORB::PublicationMulti<control_allocator_status_s> _control_allocator_status_pub[2] {ORB_ID(control_allocator_status), ORB_ID(control_allocator_status)};
 
@@ -211,6 +220,26 @@ private:
 	ParamHandles _param_handles{};
 	Params _params{};
 	bool _has_slew_rate{false};
+
+	// --- Inhibition state (cached from actuator_inhibit uORB) ---
+	struct InhibitState {
+		static constexpr int MAX = actuator_motors_s::NUM_CONTROLS;
+		bool        active[MAX]{};          // rule exists for this motor
+		bool        phase_on[MAX]{};        // toggling phase (true => apply inhibit)
+		float       toggle_hz[MAX]{};       // cached toggle frequency
+		hrt_abstime end_us[MAX]{};          // 0 => indefinite
+		hrt_abstime next_toggle_us[MAX]{};  // next phase flip time
+		hrt_abstime half_period_us[MAX]{};  // half period for square-wave
+	};
+
+	InhibitState _inhibit{};
+
+	hrt_abstime _inhibit_end_us[actuator_motors_s::NUM_CONTROLS] {};
+	float       _inhibit_toggle_hz[actuator_motors_s::NUM_CONTROLS] {};
+	hrt_abstime _toggle_interval_us[actuator_motors_s::NUM_CONTROLS] {};
+	hrt_abstime _inhibit_next_toggle_us[actuator_motors_s::NUM_CONTROLS] {};
+	bool        _inhibit_phase_on[actuator_motors_s::NUM_CONTROLS] {};
+
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::CA_AIRFRAME>) _param_ca_airframe,
