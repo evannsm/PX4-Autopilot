@@ -216,6 +216,7 @@ private:
 	hrt_abstime _last_run{0};
 	hrt_abstime _timestamp_sample{0};
 	hrt_abstime _last_status_pub{0};
+	hrt_abstime _last_print_time{0};
 
 	ParamHandles _param_handles{};
 	Params _params{};

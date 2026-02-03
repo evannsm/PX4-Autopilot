@@ -806,7 +806,13 @@ ControlAllocator::publish_actuator_controls()
 		++actuator_idx;
 	}
 
-	PX4_INFO("Setpoint for Actuator Motors [%f, %f, %f, %f]", (double)actuator_motors.control[0], (double)actuator_motors.control[1], (double)actuator_motors.control[2], (double)actuator_motors.control[3]);
+	// Rate-limit print
+	constexpr float print_rate_hz = 1.f;
+	constexpr hrt_abstime print_interval_us = static_cast<hrt_abstime>(1e6f / print_rate_hz);
+	if (now - _last_print_time >= print_interval_us) {
+		PX4_INFO("Setpoint for Actuator Motors [%f, %f, %f, %f]", (double)actuator_motors.control[0], (double)actuator_motors.control[1], (double)actuator_motors.control[2], (double)actuator_motors.control[3]);
+		_last_print_time = now;
+	}
 
 	// PX4_INFO("_num_actuators[0]: %d", _num_actuators[0]);
 
